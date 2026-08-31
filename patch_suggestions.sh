@@ -1,0 +1,46 @@
+#!/bin/bash
+awk '
+/\{\/\* Actions Dropdown Menu \(Mobile-Friendly\) \*\/\}/ {
+  print "      {/* Suggestions Dropdown Menu */}"
+  print "      {!isGenerating && !isMinimized && version?.prompts && version.prompts.length > 0 && ("
+  print "        <div className=\"border-t-2 border-black bg-blue-50 relative z-20\">"
+  print "          <button"
+  print "            onClick={(e) => {"
+  print "              e.stopPropagation();"
+  print "              setIsSuggestionsMenuOpen(!isSuggestionsMenuOpen);"
+  print "            }}"
+  print "            className=\"w-full flex items-center justify-between p-3 text-left font-bold uppercase tracking-wider text-xs text-blue-900 hover:bg-blue-100 transition-colors cursor-pointer\""
+  print "          >"
+  print "            <span className=\"flex items-center gap-2\">"
+  print "              <Sparkles size={14} />"
+  print "              AI Suggestions"
+  print "            </span>"
+  print "            <ChevronRight size={14} className={`transition-transform duration-200 ${isSuggestionsMenuOpen ? \"rotate-90\" : \"\"}`} />"
+  print "          </button>"
+  print "          "
+  print "          {isSuggestionsMenuOpen && ("
+  print "            <div className=\"flex flex-col bg-white border-t-2 border-black\">"
+  print "              {version.prompts.map((promptStr, i) => ("
+  print "                <button"
+  print "                  key={`suggest-${i}`}"
+  print "                  onClick={(e) => {"
+  print "                    e.stopPropagation();"
+  print "                    setIsSuggestionsMenuOpen(false);"
+  print "                    onExpand(promptStr, node.id);"
+  print "                  }}"
+  print "                  className=\"w-full flex items-start p-3 text-left hover:bg-blue-50 transition-colors text-xs font-medium text-gray-800 cursor-pointer border-b border-gray-200 last:border-b-0\""
+  print "                >"
+  print "                  <Sparkles size={12} className=\"mr-2 mt-0.5 flex-shrink-0 text-blue-600\" />"
+  print "                  <span className=\"whitespace-normal leading-relaxed break-words\">{promptStr}</span>"
+  print "                </button>"
+  print "              ))}"
+  print "            </div>"
+  print "          )}"
+  print "        </div>"
+  print "      )}"
+  print ""
+  print $0
+  next
+}
+{ print }
+' src/components/NodeCard.tsx > tmp_card.tsx && mv tmp_card.tsx src/components/NodeCard.tsx
