@@ -1,5 +1,15 @@
 export type EdgeType = 'default' | 'source_of_truth' | 'style_reference' | 'counter_argument' | 'correction';
 
+export interface DocumentChunk {
+  id: string;
+  nodeId: string;
+  sourceName: string;
+  text: string;
+  heading?: string;
+  page?: number;
+  embedding?: number[];
+}
+
 export interface EdgeConnection {
   sourceId: string;
   type: EdgeType;
@@ -19,6 +29,8 @@ export interface FrameData {
   height: number;
 }
 
+export type NodeRole = 'evidence' | 'hypothesis' | 'stress_test' | 'decision' | 'standard';
+
 export interface GridNodeData {
   id: string;
   x: number;
@@ -34,6 +46,8 @@ export interface GridNodeData {
   parentIds?: string[];
   incomingEdges?: EdgeConnection[];
   type?: 'source' | 'lens' | 'default';
+  role?: NodeRole;
+  confidenceScore?: number;
   settings?: {
     customModel?: string;
     persona?: string;
@@ -47,8 +61,9 @@ export interface GridNodeData {
     uri?: string;  // Gemini File API uri
     name?: string; // Original filename
     localUrl?: string; // Object URL for browser preview
-    chunks?: { text: string, embedding: number[] }[]; // Attention Mapping chunks
+    chunks?: DocumentChunk[]; // Embedded semantic memory chunks
   };
+  chunks?: DocumentChunk[]; // Node-level memory chunks
   memorySnapshot?: string; // Background compression block
   executionLog?: ExecutionLog; // Pinpoint Debugging
 }
@@ -60,6 +75,14 @@ export interface ExecutionLog {
   error?: string;
   latencyMs?: number;
   timestamp: number;
+  retrievedChunks?: {
+    id: string;
+    nodeId: string;
+    sourceName: string;
+    heading?: string;
+    text: string;
+    score: number;
+  }[];
 }
 
 export interface NodeVersion {

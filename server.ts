@@ -32,6 +32,112 @@ async function startServer() {
     });
   };
 
+  // Helper to generate vector embeddings using Gemini
+  const generateEmbeddings = async (ai: GoogleGenAI, texts: string[]): Promise<number[][]> => {
+    if (!texts || texts.length === 0) return [];
+    const contents = texts.map(t => ({ parts: [{ text: (t || " ").slice(0, 8000) }] }));
+    const batchSize = 20;
+    const allEmbeddings: number[][] = [];
+
+    for (let i = 0; i < contents.length; i += batchSize) {
+      const batch = contents.slice(i, i + batchSize);
+      let resp;
+      try {
+        resp = await ai.models.embedContent({
+          model: "gemini-embedding-2-preview",
+          contents: batch,
+        });
+      } catch (err1) {
+        console.warn("gemini-embedding-2-preview failed, falling back to text-embedding-004:", err1);
+        try {
+          resp = await ai.models.embedContent({
+            model: "text-embedding-004",
+            contents: batch,
+          });
+        } catch (err2) {
+          console.error("Embedding model fallback also failed:", err2);
+        }
+      }
+
+      if (resp && resp.embeddings) {
+        for (const emb of resp.embeddings) {
+          allEmbeddings.push(emb.values || []);
+        }
+      }
+    }
+    return allEmbeddings;
+  };
+
+  // Vector Embedding endpoint for client-side search queries
+  app.post("/api/embed", async (req, res) => {
+    try {
+      const { texts } = req.body;
+      if (!texts || !Array.isArray(texts) || texts.length === 0) {
+        return res.status(400).json({ error: "texts array is required" });
+      }
+      const ai = getAiInstance(req);
+      const embeddings = await generateEmbeddings(ai, texts);
+      res.json({ embeddings });
+    } catch (error: any) {
+      console.error("Error in /api/embed:", error);
+      res.status(500).json({ error: error.message || "Failed to generate embeddings." });
+    }
+  });
+
+  // Chunk and vectorize plain text / pasted knowledge blocks
+  app.post("/api/chunk-text", async (req, res) => {
+    try {
+      const { text, sourceName } = req.body;
+      if (!text || !text.trim()) {
+        return res.status(400).json({ error: "text is required" });
+      }
+      const ai = getAiInstance(req);
+      
+      const paragraphs = text.split(/\n\s*\n/).map((p: string) => p.trim()).filter(Boolean);
+      const chunkTexts: { heading: string, text: string }[] = [];
+      
+      if (paragraphs.length <= 1 && text.length < 800) {
+        chunkTexts.push({ heading: sourceName || "Text Note", text: text.trim() });
+      } else {
+        let currentHeading = sourceName || "Knowledge Section";
+        let curChunk = "";
+        for (const p of paragraphs) {
+          if (p.startsWith("#")) {
+            if (curChunk.trim()) {
+              chunkTexts.push({ heading: currentHeading, text: curChunk.trim() });
+              curChunk = "";
+            }
+            currentHeading = p.replace(/^#+\s*/, '').trim() || currentHeading;
+          }
+          curChunk += (curChunk ? "\n\n" : "") + p;
+          if (curChunk.length > 1000) {
+            chunkTexts.push({ heading: currentHeading, text: curChunk.trim() });
+            curChunk = "";
+          }
+        }
+        if (curChunk.trim()) {
+          chunkTexts.push({ heading: currentHeading, text: curChunk.trim() });
+        }
+      }
+
+      const textsToEmbed = chunkTexts.map(c => `${c.heading}: ${c.text}`);
+      const embeddings = await generateEmbeddings(ai, textsToEmbed);
+      
+      const chunks = chunkTexts.map((c, idx) => ({
+        id: `chunk-${Date.now()}-${idx}`,
+        sourceName: sourceName || "Text Note",
+        heading: c.heading,
+        text: c.text,
+        embedding: embeddings[idx] || []
+      }));
+
+      res.json({ chunks });
+    } catch (error: any) {
+      console.error("Error in /api/chunk-text:", error);
+      res.status(500).json({ error: error.message || "Failed to chunk text." });
+    }
+  });
+
   app.post("/api/upload", upload.single("file"), async (req, res) => {
     try {
       if (!req.file) {
@@ -40,8 +146,9 @@ async function startServer() {
 
       const ai = getAiInstance(req);
       const mimeType = req.file.mimetype;
+      const originalName = req.file.originalname || "document";
       
-      // Upload directly to Gemini File Storage
+      // 1. Upload directly to Gemini File Storage for multimodal grounding
       const uploadResult = await ai.files.upload({
         file: req.file.path,
         config: {
@@ -49,18 +156,116 @@ async function startServer() {
         }
       });
 
-      // Cleanup temp file
-      fs.unlinkSync(req.file.path);
+      // Cleanup temp file on disk
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (cleanupErr) {
+        console.warn("Temp file cleanup warning:", cleanupErr);
+      }
+
+      // 2. Extract semantic chunks if it's a document (PDF, doc, text, json, csv, etc.)
+      let semanticChunks: Array<{ heading: string, text: string }> = [];
+      let docSummary = "";
+      
+      const isDocument = mimeType.includes("pdf") || 
+                         mimeType.includes("text") || 
+                         mimeType.includes("document") || 
+                         mimeType.includes("csv") ||
+                         mimeType.includes("json") ||
+                         originalName.toLowerCase().endsWith(".pdf") ||
+                         originalName.toLowerCase().endsWith(".txt") ||
+                         originalName.toLowerCase().endsWith(".md");
+
+      if (isDocument) {
+        try {
+          const extractionResponse = await ai.models.generateContent({
+            model: "gemini-3.1-flash-lite",
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    fileData: {
+                      fileUri: uploadResult.uri,
+                      mimeType: uploadResult.mimeType || mimeType
+                    }
+                  },
+                  {
+                    text: `You are an expert Document Ingestion & Knowledge Indexing Engine.
+Analyze this document thoroughly and extract its complete factual content into distinct, coherent semantic chunks for vector storage.
+Rules:
+1. Divide the document into 4 to 15 semantic chunks based on sections, topics, tables, or criteria.
+2. Preserve exact names, numbers, institutions, rankings, percentages, candidate details, and data points in the chunk text.
+3. Provide a clear 'heading' for each chunk representing its topic or section.
+4. Also provide a concise 2-sentence 'summary' of the entire document.
+
+Return STRICTLY valid JSON with no markdown formatting:
+{
+  "summary": "Concise 2-sentence summary",
+  "chunks": [
+    {
+      "heading": "Section Heading",
+      "text": "Detailed content of this section..."
+    }
+  ]
+}`
+                  }
+                ]
+              }
+            ],
+            config: {
+              responseMimeType: "application/json",
+              temperature: 0.1
+            }
+          });
+
+          let rawExtract = extractionResponse.text || "{}";
+          rawExtract = rawExtract.replace(/```(json)?/gi, '').trim();
+          const parsed = JSON.parse(rawExtract);
+          docSummary = parsed.summary || "";
+          if (Array.isArray(parsed.chunks) && parsed.chunks.length > 0) {
+            semanticChunks = parsed.chunks;
+          }
+        } catch (extractErr) {
+          console.warn("Document semantic chunk extraction had non-fatal error:", extractErr);
+        }
+      }
+
+      // 3. Generate vector embeddings for extracted chunks
+      let finalChunks: any[] = [];
+      if (semanticChunks.length > 0) {
+        try {
+          const textsToEmbed = semanticChunks.map(c => `${c.heading}: ${c.text}`);
+          const embeddings = await generateEmbeddings(ai, textsToEmbed);
+          finalChunks = semanticChunks.map((c, idx) => ({
+            id: `chunk-${Date.now()}-${idx}`,
+            sourceName: originalName,
+            heading: c.heading || `Section ${idx + 1}`,
+            text: c.text,
+            embedding: embeddings[idx] || []
+          }));
+        } catch (embedErr) {
+          console.warn("Chunk vector embedding had non-fatal error:", embedErr);
+          finalChunks = semanticChunks.map((c, idx) => ({
+            id: `chunk-${Date.now()}-${idx}`,
+            sourceName: originalName,
+            heading: c.heading || `Section ${idx + 1}`,
+            text: c.text,
+            embedding: []
+          }));
+        }
+      }
 
       res.json({
         name: uploadResult.name,
         uri: uploadResult.uri,
-        mimeType: uploadResult.mimeType,
-        chunks: []
+        mimeType: uploadResult.mimeType || mimeType,
+        summary: docSummary,
+        chunks: finalChunks
       });
     } catch (error: any) {
       console.error("Error in upload:", error);
-      res.status(500).json({ error: "Failed to process file." });
+      res.status(500).json({ error: "Failed to process file: " + (error?.message || String(error)) });
     }
   });
 
@@ -249,7 +454,7 @@ Do not include markdown blocks, just raw JSON.`;
 
   app.post("/api/generate", async (req, res) => {
     try {
-      const { prompt, context, customModel, customPersona, capability } = req.body;
+      const { prompt, context, customModel, customPersona, capability, role } = req.body;
       const providerModel = req.headers['x-provider-text'] as string || 'gemini|gemini-3.1-flash-lite';
       const [provider, modelIdTemp] = providerModel.split('|');
       let modelId = modelIdTemp === "gemini-3.1-pro" ? "gemini-3.1-pro-preview" : modelIdTemp;
@@ -276,6 +481,14 @@ Do not include markdown blocks, just raw JSON.`;
 
       let systemInstruction = "You are a dynamic spatial-knowledge-engine generator. You receive past conversation or factual knowledge in the \"Source Context\". CRITICAL INSTRUCTION ON TONE: Do NOT inherit or mimic the tone, writing style, or persona of the Source Context. You must answer the new Task organically, adapting your tone entirely to match the user\"s new Task (e.g., if the context is a medical paper, but the new Task is a simple \"yes/no\" question, answer casually and briefly). If the Task is \"Synthesize concepts from X nodes\", deeply analyze the connections and contradictions across all provided Source Context nodes. If you use facts, claims, or data from the Source Context, you MUST cite your source immediately after the claim using the format `[Source](#node_id)` where `node_id` is the ID of the node provided in the context (e.g. 'The market grew by 20% [2023 Report](#node-1234)'). Generate AI content in a specific JSON format containing: \"text\" (AI-generated text. Use markdown if necessary. CRITICAL: Wrap 2 to 4 key concepts or interesting terms in your text as markdown links using the exact format `[Search Term](Search Term)`, so users can click them to branch off!), and \"prompts\" (an array of 3 string items containing suggested follow-up queries or Lenses). RETURN ONLY VALID JSON.";
       
+      if (role === 'stress_test') {
+        systemInstruction += "\n\n[EPISTEMIC ROLE: ADVERSARIAL STRESS-TEST & DEVIL'S ADVOCATE]\nYou are a rigorous Devil's Advocate and Stress-Tester. Point out hidden assumptions, fatal edge cases, economic/technical liabilities, and logical contradictions in the thesis. Be direct, incisive, and cite any contradictory source facts.";
+      } else if (role === 'decision') {
+        systemInstruction += "\n\n[EPISTEMIC ROLE: AUDIT-PROOF DECISION VERDICT]\nYou are an Executive Decision Engine. Synthesize the competing hypotheses, grounding evidence, and stress-tests from the Source Context. Provide a clear Verdict, an explicit Confidence Rating (e.g. 85%), addressed trade-offs, and decisive recommendations.";
+      } else if (role === 'evidence') {
+        systemInstruction += "\n\n[EPISTEMIC ROLE: GROUND TRUTH EVIDENCE]\nYou are an Evidence Extraction Specialist. Extract verifiable facts, statistics, benchmark data, and direct quotes from the context without speculative fluff.";
+      }
+
       if (formatCoercion) {
         systemInstruction += "\n\n" + formatCoercion;
         console.log(`[SEMANTIC COERCION] Intercepted prompt and applied format constraint.`);

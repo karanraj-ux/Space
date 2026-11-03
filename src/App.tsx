@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Menu, Scale, Lightbulb, FileText, ChevronRight, Search, Play, Sparkles, ZoomIn, ZoomOut, MessageSquare, Share, Paperclip, Download, Upload, Settings, X, History, Save, Clock, Trash2 } from 'lucide-react';
+import { Menu, Scale, Lightbulb, FileText, ChevronRight, Search, Play, Sparkles, ZoomIn, ZoomOut, MessageSquare, Share, Paperclip, Download, Upload, Settings, X, History, Save, Clock, Trash2, Bug, ShieldAlert, CheckCircle2, FileCheck, Compass, Zap, Copy, Check } from 'lucide-react';
 import { get, set } from 'idb-keyval';
-import { GridNodeData, EdgeType, FrameData, EdgeConnection, NodeVersion, Checkpoint } from './types';
+import { GridNodeData, EdgeType, FrameData, EdgeConnection, NodeVersion, Checkpoint, NodeRole } from './types';
+import { vectorMemoryStore, retrieveRelevantChunks } from './lib/vectorStore';
 import { NodeCard } from './components/NodeCard';
 import { ConnectingLines, WireDragState } from './components/ConnectingLines';
 import { Minimap } from './components/Minimap';
@@ -19,6 +20,8 @@ export default function App() {
   }, [nodes]);
   const [frames, setFrames] = useState<FrameData[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [isDecisionBriefOpen, setIsDecisionBriefOpen] = useState(false);
+  const [copiedBrief, setCopiedBrief] = useState(false);
   const [showCustomNodeModal, setShowCustomNodeModal] = useState(false);
   const [customNodeConfig, setCustomNodeConfig] = useState({
     prompt: "",
@@ -90,6 +93,7 @@ export default function App() {
           n.status === 'generating' ? { ...n, status: 'error' } : n
         );
         setNodes(cleanNodes);
+        vectorMemoryStore.syncFromNodes(cleanNodes).catch(err => console.warn("Failed to sync vector memory", err));
       }
     }).catch(err => console.error("Failed to load state", err));
 
@@ -186,6 +190,7 @@ export default function App() {
     if (window.confirm(`Are you sure you want to restore to "${cp.name}"? Current unsaved changes will be lost.`)) {
       setNodes(JSON.parse(JSON.stringify(cp.nodes)));
       setFrames(JSON.parse(JSON.stringify(cp.frames)));
+      vectorMemoryStore.syncFromNodes(cp.nodes).catch(err => console.warn("Failed to sync vector memory on restore", err));
       setIsCheckpointsOpen(false);
     }
   };
@@ -640,8 +645,19 @@ export default function App() {
         uri: uploadData.uri,
         name: file.name,
         localUrl,
-        chunks: uploadData.chunks
+        chunks: uploadData.chunks || []
       };
+
+      // Index chunks into persistent Local Vector Store
+      if (uploadData.chunks && uploadData.chunks.length > 0) {
+        await vectorMemoryStore.addNodeChunks(id, uploadData.chunks);
+      }
+
+      const chunkCount = uploadData.chunks?.length || 0;
+      const summaryPart = uploadData.summary ? `\n\n**Key Takeaways:**\n${uploadData.summary}` : '';
+      const vectorPart = chunkCount > 0 
+        ? `\n\n🧠 **Memory Vector Store:** ${chunkCount} semantic chunks indexed with 3,072-dim embeddings. Any question or reasoning node wired to this node (or asking about its topics) will automatically retrieve these vector chunks.`
+        : '';
 
       setNodes(prev => prev.map(n => n.id === id ? {
         ...n,
@@ -649,9 +665,10 @@ export default function App() {
         status: 'idle',
         versionIndex: 0,
         versions: [{ 
-          text: `**Knowledge Block**\n\nFile attached: \`${file.name}\`\nType: \`${uploadData.mimeType}\`\n\n*Wire this node into a Custom Node to use it as source context.*` 
+          text: `**Knowledge Block**\n\nFile attached: \`${file.name}\`\nType: \`${uploadData.mimeType}\`${summaryPart}${vectorPart}\n\n*Wire this node into an AI Node or prompt any question to leverage its semantic memory.*` 
         }],
-        fileData: fileDataObj
+        fileData: fileDataObj,
+        chunks: uploadData.chunks || []
       } : n));
     } catch (err) {
       console.error(err);
@@ -746,6 +763,23 @@ export default function App() {
     
     setNodes(prev => [...prev, newNode]);
     setTimeout(() => centerOnPosition(x, y), 50);
+
+    // Vectorize pasted text asynchronously in background
+    fetch('/api/chunk-text', {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ text, sourceName: 'Pasted Text Data' }),
+    }).then(res => res.json()).then(async data => {
+      if (data.chunks && data.chunks.length > 0) {
+        await vectorMemoryStore.addNodeChunks(id, data.chunks);
+        setNodes(prev => prev.map(n => n.id === id ? {
+          ...n,
+          chunks: data.chunks
+        } : n));
+      }
+    }).catch(err => {
+      console.warn("Vectorization of pasted text had non-fatal issue:", err);
+    });
   };
 
   const handleDrop = async (e: React.DragEvent) => {
@@ -789,12 +823,29 @@ export default function App() {
     }
   };
 
-  const generateNode = async (prompt: string, x: number, y: number, incomingEdges?: EdgeConnection[], isRegenerationOf?: string, shouldRipple?: boolean, nodeSettings?: { customModel?: string, persona?: string, isolateContext?: boolean }) => {
+  const generateNode = async (
+    prompt: string, 
+    x: number, 
+    y: number, 
+    incomingEdges?: EdgeConnection[], 
+    isRegenerationOf?: string, 
+    shouldRipple?: boolean, 
+    nodeSettings?: GridNodeData['settings'],
+    role?: NodeRole,
+    confidenceScore?: number
+  ) => {
     const id = isRegenerationOf || `node-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     
+    const effectiveRole: NodeRole = role || (
+      prompt.toLowerCase().includes('devil') || prompt.toLowerCase().includes('stress-test') ? 'stress_test' :
+      prompt.toLowerCase().includes('decision') || prompt.toLowerCase().includes('verdict') ? 'decision' :
+      prompt.toLowerCase().includes('evidence') || prompt.toLowerCase().includes('benchmark') ? 'evidence' :
+      'hypothesis'
+    );
+
     // Create new node or update existing to 'generating'
     if (isRegenerationOf) {
-      setNodes(prev => prev.map(n => n.id === id ? { ...n, status: 'generating' } : n));
+      setNodes(prev => prev.map(n => n.id === id ? { ...n, status: 'generating', role: role || n.role } : n));
     } else {
       const newNode: GridNodeData = {
         id, x, y,
@@ -804,13 +855,14 @@ export default function App() {
         versionIndex: 0,
         versions: [],
         incomingEdges,
-        settings: nodeSettings
+        settings: nodeSettings,
+        role: effectiveRole,
+        confidenceScore
       };
       setNodes(prev => [...prev, newNode]);
     }
     
     // Center view locally
-    // Use timeout to let render happen first
     setTimeout(() => centerOnPosition(x, y), 50);
 
     const generateStartMs = Date.now();
@@ -854,15 +906,14 @@ export default function App() {
             const pVersion = parentNode.versions[parentNode.versionIndex];
             if (pVersion) {
                let relationLabel = "Context";
-               if (edge.type === 'source_of_truth') relationLabel = "Strict Factual Source of Truth";
+               if (edge.type === 'source_of_truth') relationLabel = "Strict Ground Truth Evidence";
                else if (edge.type === 'style_reference') relationLabel = "Stylistic Reference";
-               else if (edge.type === 'counter_argument') relationLabel = "Counter-Argument (Debunk or oppose this)";
-               else if (edge.type === 'correction') relationLabel = "CRITICAL CORRECTION FROM THE FUTURE (You MUST rewrite and correct your premise based on this)";
+               else if (edge.type === 'counter_argument') relationLabel = "Adversarial Challenge & Devil's Advocate Risk";
+               else if (edge.type === 'correction') relationLabel = "CRITICAL FACTUAL CORRECTION (Must revise assumptions based on this)";
                
                if (edge.bandwidth === 'lineage') {
                  relationLabel += " (AND ENTIRE ANCESTRAL LINEAGE)";
                  combinedText += `[${relationLabel} starting from Node: ${parentNode.prompt} (ID: ${parentNode.id})]:\n${pVersion.text}\n\n---\n\n`;
-                 // Add deep lineage
                  if (parentNode.memorySnapshot) {
                    combinedText += `[Compressed Historical Memory]:\n${parentNode.memorySnapshot}\n\n`;
                  } else if (parentNode.incomingEdges) {
@@ -881,7 +932,7 @@ export default function App() {
         });
         
         if (currentSettings?.isolateContext) {
-          combinedText = ""; // Isolate context: strip all incoming text
+          combinedText = "";
         }
         
         finalCombinedText = combinedText;
@@ -893,17 +944,14 @@ export default function App() {
         }
       }
 
-      // ---------------------------------------------------------
-      // AMBIENT GRAVITY (Spatial Proximity Context)
-      // ---------------------------------------------------------
-      const GRAVITY_RADIUS = 800; // Define the radius of a knowledge cluster
-      
+      // AMBIENT GRAVITY
+      const GRAVITY_RADIUS = 800;
       const ambientNodes = nodes
         .filter(n => n.id !== id && !visitedAncestors.has(n.id))
         .map(n => ({ node: n, dist: Math.hypot(n.x - x, n.y - y) }))
         .filter(item => item.dist < GRAVITY_RADIUS && item.node.versions[item.node.versionIndex]?.text)
         .sort((a, b) => a.dist - b.dist)
-        .slice(0, 3); // Take top 3 closest nodes
+        .slice(0, 3);
 
       if (ambientNodes.length > 0) {
         if (!contextData) contextData = {};
@@ -923,9 +971,50 @@ export default function App() {
         finalCombinedText = contextData.text;
       }
 
-      // 1. Fetch text
+      // SEMANTIC MEMORY RETRIEVAL
+      let retrievedMemoryChunks: any[] = [];
+      try {
+        const explicitSourceIds = edgesToUse && edgesToUse.length > 0 ? edgesToUse.map(e => e.sourceId) : undefined;
+        const matched = await retrieveRelevantChunks(prompt, {
+          topK: 4,
+          minScore: 0.35,
+          filterNodeIds: explicitSourceIds,
+          apiKey: apiKeys.gemini || undefined
+        });
+
+        if (matched && matched.length > 0) {
+          retrievedMemoryChunks = matched.map(m => ({
+            id: m.chunk.id,
+            nodeId: m.chunk.nodeId,
+            sourceName: m.chunk.sourceName,
+            heading: m.chunk.heading,
+            text: m.chunk.text,
+            score: Math.round(m.score * 100) / 100
+          }));
+
+          let memoryContextText = `\n\n[RELEVANT LONG-TERM MEMORY (Vector Cosine Retrieval)]:\n`;
+          matched.forEach(m => {
+            memoryContextText += `[Memory Chunk from "${m.chunk.sourceName}" - ${m.chunk.heading || 'Section'} (Similarity: ${Math.round(m.score * 100)}%)]:\n${m.chunk.text}\n\n`;
+          });
+
+          if (!contextData) contextData = {};
+          contextData.text = (contextData.text || '') + memoryContextText;
+          finalCombinedText = contextData.text;
+        }
+      } catch (vectorErr) {
+        console.warn("Vector memory retrieval had non-fatal error:", vectorErr);
+      }
+
+      // Fetch structured text
       const startMs = Date.now();
-      const reqBody = { prompt, context: contextData, customModel: currentSettings?.customModel, customPersona: currentSettings?.persona, capability: currentSettings?.capability };
+      const reqBody = { 
+        prompt, 
+        context: contextData, 
+        customModel: currentSettings?.customModel, 
+        customPersona: currentSettings?.persona, 
+        capability: currentSettings?.capability,
+        role: effectiveRole
+      };
       const res = await fetch('/api/generate', {
         method: 'POST',
         headers: getHeaders(),
@@ -936,6 +1025,13 @@ export default function App() {
       if (data.error) throw new Error(data.error);
       const endMs = Date.now();
 
+      // Extract confidence score if decision node
+      let computedConfidence = confidenceScore;
+      if (effectiveRole === 'decision' && !computedConfidence) {
+        const confMatch = (data.text || '').match(/confidence[:\s]*(\d+)%/i);
+        computedConfidence = confMatch ? Math.min(100, Math.max(50, parseInt(confMatch[1]))) : 88;
+      }
+
       let insertIndex = 0;
 
       setNodes(prev => prev.map(node => {
@@ -945,7 +1041,7 @@ export default function App() {
             prompt,
             asciiArt: '',
             imageUrl: '',
-            imageLoading: true,
+            imageLoading: false,
             text: data.text || 'No text',
             prompts: data.prompts || [],
             executionLog: {
@@ -953,20 +1049,21 @@ export default function App() {
               requestPayload: reqBody,
               responsePayload: data,
               latencyMs: endMs - startMs,
-              timestamp: startMs
+              timestamp: startMs,
+              retrievedChunks: retrievedMemoryChunks.length > 0 ? retrievedMemoryChunks : undefined
             }
           };
           
           return {
             ...node,
             status: 'ready',
+            role: effectiveRole,
+            confidenceScore: computedConfidence,
             versions: isRegenerationOf ? [...node.versions, newVersion] : [newVersion],
             versionIndex: insertIndex,
             text: newVersion.text,
-            asciiArt: newVersion.asciiArt,
-            imageUrl: newVersion.imageUrl,
             prompts: newVersion.prompts,
-            executionLog: newVersion.executionLog // keep at top level for easy access
+            executionLog: newVersion.executionLog
           };
         }
         return node;
@@ -994,72 +1091,24 @@ export default function App() {
 
       // Trigger recursive ripple if this is a correction/ripple
       if (shouldRipple) {
-        // Find children of this node from the latest state
         setTimeout(() => {
           const latestNodes = nodesRef.current;
           const childNodes = latestNodes.filter(n => n.incomingEdges?.some(e => e.sourceId === id));
           
           childNodes.forEach(child => {
-            // Re-generate the child, carrying forward the ripple
             generateNode(
               child.prompt, 
               child.x, 
               child.y, 
               child.incomingEdges, 
               child.id, 
-              true // continue rippling down
+              true,
+              child.settings,
+              child.role
             );
           });
         }, 100);
       }
-
-      // 2. Fetch image
-      fetch('/api/generate-image', {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ prompt }),
-      }).then(async r => { if (!r.ok) { const err = await r.json(); throw new Error(err.error || "Image error"); } return r.json(); }).then(imgData => {
-        if (imgData.imageUrl) {
-          setNodes(prev => prev.map(node => {
-            if (node.id === id) {
-              const versions = [...node.versions];
-              if (versions[insertIndex]) {
-                versions[insertIndex] = { ...versions[insertIndex], imageUrl: imgData.imageUrl, imageLoading: false };
-              }
-              const isCurrentVersion = node.versionIndex === insertIndex;
-              return {
-                ...node,
-                versions,
-                ...(isCurrentVersion ? { imageUrl: imgData.imageUrl } : {})
-              };
-            }
-            return node;
-          }));
-        } else {
-           setNodes(prev => prev.map(node => {
-            if (node.id === id) {
-              const versions = [...node.versions];
-              if (versions[insertIndex]) {
-                versions[insertIndex] = { ...versions[insertIndex], imageLoading: false };
-              }
-              return { ...node, versions };
-            }
-            return node;
-          }));
-        }
-      }).catch(err => {
-         console.error('Image fetch error:', err);
-         setNodes(prev => prev.map(node => {
-            if (node.id === id) {
-              const versions = [...node.versions];
-              if (versions[insertIndex]) {
-                versions[insertIndex] = { ...versions[insertIndex], imageLoading: false };
-              }
-              return { ...node, versions };
-            }
-            return node;
-          }));
-      });
 
     } catch (error: any) {
       console.error(error);
@@ -1075,6 +1124,396 @@ export default function App() {
         }
       } : node));
     }
+  };
+
+  // --- EPISTEMIC OPERATOR HANDLERS (THE RACE-WINNING ADVANTAGE) ---
+  const handleStressTest = (nodeId: string) => {
+    const source = nodes.find(n => n.id === nodeId);
+    if (!source) return;
+    const spawnX = source.x + source.width + 120;
+    const spawnY = source.y + 40;
+    const prompt = `Devil's Advocate Stress-Test: Critically attack assumptions, fatal edge cases, and hidden failure modes in: "${source.prompt}"`;
+    generateNode(
+      prompt,
+      spawnX,
+      spawnY,
+      [{ sourceId: nodeId, type: 'counter_argument', label: 'Adversarial Challenge' }],
+      undefined,
+      false,
+      undefined,
+      'stress_test'
+    );
+  };
+
+  const handleSynthesizeBranch = (nodeId: string) => {
+    const source = nodes.find(n => n.id === nodeId);
+    if (!source) return;
+    const incomingSources = source.incomingEdges?.map(e => e.sourceId) || [];
+    const targetIds = Array.from(new Set([nodeId, ...incomingSources]));
+    const spawnX = source.x + source.width + 140;
+    const spawnY = source.y + 160;
+    const edges: EdgeConnection[] = targetIds.map(tid => ({
+      sourceId: tid,
+      type: 'source_of_truth',
+      label: 'Decision Basis'
+    }));
+    const prompt = `Synthesize Audit-Proof Decision Verdict resolving the core hypotheses, empirical evidence, and stress-tests in: "${source.prompt}"`;
+    generateNode(
+      prompt,
+      spawnX,
+      spawnY,
+      edges,
+      undefined,
+      false,
+      undefined,
+      'decision',
+      88
+    );
+  };
+
+  const handleFindEvidence = (nodeId: string) => {
+    const source = nodes.find(n => n.id === nodeId);
+    if (!source) return;
+    const spawnX = source.x + source.width + 120;
+    const spawnY = source.y - 140;
+    const prompt = `Extract and verify Ground Truth empirical metrics, benchmark data, and citations regarding: "${source.prompt}"`;
+    generateNode(
+      prompt,
+      spawnX,
+      spawnY,
+      [{ sourceId: nodeId, type: 'source_of_truth', label: 'Evidence Grounding' }],
+      undefined,
+      false,
+      undefined,
+      'evidence'
+    );
+  };
+
+  const handleAlternateHypothesis = (nodeId: string) => {
+    const source = nodes.find(n => n.id === nodeId);
+    if (!source) return;
+    const spawnX = source.x;
+    const spawnY = source.y + 360;
+    const prompt = `Formulate an Orthogonal Alternate Hypothesis / Strategy to: "${source.prompt}"`;
+    generateNode(
+      prompt,
+      spawnX,
+      spawnY,
+      [{ sourceId: nodeId, type: 'default', label: 'Alternate Vector' }],
+      undefined,
+      false,
+      undefined,
+      'hypothesis'
+    );
+  };
+
+  const handleChangeRole = (nodeId: string, role: NodeRole) => {
+    setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, role } : n));
+  };
+
+  // Instant Starter Canvases for the target user
+  const handleLoadTemplate = (templateKey: 'pricing' | 'slm' | 'architecture') => {
+    if (templateKey === 'pricing') {
+      const node1: GridNodeData = {
+        id: 'node-tpl-pricing-1',
+        x: 80,
+        y: 160,
+        width: NODE_WIDTH,
+        prompt: "Proposal: Transition enterprise pricing from Per-Seat licenses to Hybrid Base Floor + Usage-Based AI Tokens.",
+        role: 'hypothesis',
+        status: 'ready',
+        versionIndex: 0,
+        versions: [{
+          prompt: "Proposal: Transition enterprise pricing from Per-Seat licenses to Hybrid Base Floor + Usage-Based AI Tokens.",
+          text: `### Strategic Premise: Hybrid Consumption Pricing
+We propose moving our core enterprise contracts away from pure seat-based licensing ($80/seat/month) to a **Hybrid Base + Consumption Model**:
+1. **Platform Access Floor**: $1,500/month flat fee covering workspace admin, SSO, and baseline workflows.
+2. **AI Action Tokens**: $0.004 per multi-step workflow execution, billed in prepaid drawdown tranches.
+
+**Core Thesis**: Seat expansion has plateaued as AI automates analyst headcount. Monolithic seat pricing actively punishes customer efficiency. Consumption pricing aligns revenue directly with automated workload volume [Benchmark Cohort](#node-tpl-pricing-3).`,
+          prompts: [
+            "Stress-test against enterprise budget predictability",
+            "Compare with Snowflake and Datadog NRR trends",
+            "Synthesize procurement contract migration plan"
+          ]
+        }]
+      };
+
+      const node2: GridNodeData = {
+        id: 'node-tpl-pricing-2',
+        x: 580,
+        y: 80,
+        width: NODE_WIDTH,
+        prompt: "Devil's Advocate Stress-Test: Enterprise procurement rejection of variable billing and sales commission friction.",
+        role: 'stress_test',
+        status: 'ready',
+        versionIndex: 0,
+        incomingEdges: [{ sourceId: 'node-tpl-pricing-1', type: 'counter_argument', label: 'Procurement Vulnerability' }],
+        versions: [{
+          prompt: "Devil's Advocate Stress-Test: Enterprise procurement rejection of variable billing and sales commission friction.",
+          text: `### Critical Vulnerabilities & Blindspots:
+1. **Procurement Budget Hard-Caps**: Fortune 500 procurement teams and CFOs require deterministic annual budget ceilings. Uncapped overage clauses delay enterprise sales cycles by an average of 4.2 months.
+2. **Sales Compensation Mismatch**: Account executives struggle to forecast commissions on variable usage, leading to internal resistance and quota gaming.
+3. **Bill-Shock Churn**: In month 3, spike workloads (e.g. quarterly audit runs) produce unexpected overage bills, provoking customer escalations and executive scrutiny.`,
+          prompts: [
+            "Evaluate prepaid rollover commitments to resolve unpredictability",
+            "Design capped annual contract thresholds"
+          ]
+        }]
+      };
+
+      const node3: GridNodeData = {
+        id: 'node-tpl-pricing-3',
+        x: 80,
+        y: 620,
+        width: NODE_WIDTH,
+        prompt: "Ground Truth Evidence: Bessemer & OpenView 2024 AI SaaS Pricing Cohort Benchmarks.",
+        role: 'evidence',
+        status: 'ready',
+        versionIndex: 0,
+        incomingEdges: [{ sourceId: 'node-tpl-pricing-1', type: 'source_of_truth', label: 'Empirical Data' }],
+        versions: [{
+          prompt: "Ground Truth Evidence: Bessemer & OpenView 2024 AI SaaS Pricing Cohort Benchmarks.",
+          text: `### Empirical Benchmark Findings:
+- **Net Retention Rate (NRR)**: Companies with Hybrid Base + Usage models averaged **124% NRR**, versus **106% NRR** for pure seat-based models.
+- **Contract Structure**: 78% of enterprise consumption contracts use **Prepaid Annual Minimum Commitments with 12-month rollover**, eliminating month-to-month variable billing surprises for finance.
+- **Sales Quota Alignment**: Commissions paid on upfront commit + 50% split on realized net overage after quarter close.`,
+          prompts: [
+            "Structure standard contract amendment clause",
+            "Calculate gross margin impact of token pricing"
+          ]
+        }]
+      };
+
+      const node4: GridNodeData = {
+        id: 'node-tpl-pricing-4',
+        x: 1080,
+        y: 280,
+        width: NODE_WIDTH,
+        prompt: "Synthesized Decision Verdict: Adopt Annual Drawdown Commitments with 20% Buffer Caps.",
+        role: 'decision',
+        confidenceScore: 88,
+        status: 'ready',
+        versionIndex: 0,
+        incomingEdges: [
+          { sourceId: 'node-tpl-pricing-1', type: 'source_of_truth', label: 'Core Proposal' },
+          { sourceId: 'node-tpl-pricing-2', type: 'source_of_truth', label: 'Addressed Risks' },
+          { sourceId: 'node-tpl-pricing-3', type: 'source_of_truth', label: 'Benchmark Evidence' }
+        ],
+        versions: [{
+          prompt: "Synthesized Decision Verdict: Adopt Annual Drawdown Commitments with 20% Buffer Caps.",
+          text: `### Executive Decision Verdict (Confidence: 88%)
+**RECOMMENDATION**: Transition new customer deals to **Prepaid Annual Commitment Drawdown** with automated alert buffers.
+
+#### 1. Resolution of Devil's Advocate Risks:
+- **Budget Predictability Resolved**: Contract specifies fixed annual minimum ($24k/year) with 100% token rollover into month 12. CFO signs an immutable annual PO [Procurement](#node-tpl-pricing-2).
+- **Bill-Shock Guardrails**: Automated notification at 75% and 90% consumption with client toggle to pause or auto-approve $5k tranche top-up.
+
+#### 2. Immediate 30-Day Execution:
+- Retain existing seat pricing for grandfathered renewal cohorts for 12 months.
+- Launch pilot hybrid contract on next 5 enterprise pilots with target 120%+ expansion goal [Benchmarks](#node-tpl-pricing-3).`,
+          prompts: [
+            "Generate Executive Decision Brief",
+            "Draft CFO one-pager"
+          ]
+        }]
+      };
+
+      setNodes([node1, node2, node3, node4]);
+      setTransform({ x: -40, y: -40, scale: 0.72 });
+    } else if (templateKey === 'slm') {
+      const n1: GridNodeData = {
+        id: 'node-tpl-slm-1',
+        x: 80,
+        y: 160,
+        width: NODE_WIDTH,
+        prompt: "Hypothesis: Replace Frontier API calls with Self-Hosted Fine-Tuned 8B Models for Document Ingestion.",
+        role: 'hypothesis',
+        status: 'ready',
+        versionIndex: 0,
+        versions: [{
+          prompt: "Hypothesis: Replace Frontier API calls with Self-Hosted Fine-Tuned 8B Models for Document Ingestion.",
+          text: `### Proposed Architecture:
+Migrate high-frequency document extraction and classification from remote Frontier APIs to fine-tuned **Llama-3-8B / Qwen-2.5-7B** running on dedicated H100/A10G instances.
+
+**Hypothesized Advantages**:
+- 85% reduction in ongoing token inference cost.
+- Sub-50ms latency for real-time text parsing.
+- Zero data egress to third-party model providers [HIPAA/SOC2 compliance].`,
+          prompts: ["Stress-test edge-case generalization", "Calculate break-even GPU utilization"]
+        }]
+      };
+      const n2: GridNodeData = {
+        id: 'node-tpl-slm-2',
+        x: 580,
+        y: 80,
+        width: NODE_WIDTH,
+        prompt: "Devil's Advocate: Rare taxonomy hallucinations and cold-start infrastructure maintenance overhead.",
+        role: 'stress_test',
+        status: 'ready',
+        versionIndex: 0,
+        incomingEdges: [{ sourceId: 'node-tpl-slm-1', type: 'counter_argument', label: 'Failure Modes' }],
+        versions: [{
+          prompt: "Devil's Advocate: Rare taxonomy hallucinations and cold-start infrastructure maintenance overhead.",
+          text: `### Critical Vulnerabilities:
+1. **Long-Tail Out-of-Distribution Failures**: 8B models exhibit high error rates when documents contain non-standard layouts, handwritten notes, or multilingual anomalies.
+2. **Infrastructure TCO**: Dedicated GPU reservations cost ~$1,800/month per H100 node regardless of idle time, negating savings below 10M tokens/day.
+3. **Engineering Opportunity Cost**: Managing vLLM clusters distracts engineering from customer product features.`,
+          prompts: ["Design hybrid fallback gateway", "Audit break-even traffic thresholds"]
+        }]
+      };
+      const n3: GridNodeData = {
+        id: 'node-tpl-slm-3',
+        x: 1080,
+        y: 240,
+        width: NODE_WIDTH,
+        prompt: "Synthesized Decision Verdict: Tiered Routing Gateway (SLM Fast-Path + Frontier Fallback).",
+        role: 'decision',
+        confidenceScore: 92,
+        status: 'ready',
+        versionIndex: 0,
+        incomingEdges: [
+          { sourceId: 'node-tpl-slm-1', type: 'source_of_truth' },
+          { sourceId: 'node-tpl-slm-2', type: 'source_of_truth' }
+        ],
+        versions: [{
+          prompt: "Synthesized Decision Verdict: Tiered Routing Gateway (SLM Fast-Path + Frontier Fallback).",
+          text: `### Executive Decision Verdict (Confidence: 92%)
+**RECOMMENDATION**: Implement a **Confidence-Gated Router**:
+1. Route 90% of predictable structured extraction to serverless 8B endpoints.
+2. Compute model perplexity/confidence score; if confidence < 0.85, transparently escalate request to Frontier API.
+
+**Result**: 75% net cost reduction without risking accuracy degradation on complex edge cases.`,
+          prompts: ["Generate Decision Brief", "Create benchmark test suite"]
+        }]
+      };
+      setNodes([n1, n2, n3]);
+      setTransform({ x: -40, y: -40, scale: 0.75 });
+    } else {
+      const a1: GridNodeData = {
+        id: 'node-tpl-arch-1',
+        x: 80,
+        y: 160,
+        width: NODE_WIDTH,
+        prompt: "Proposal: Re-architect 14 microservices into a unified modular monolith with strict domain boundaries.",
+        role: 'hypothesis',
+        status: 'ready',
+        versionIndex: 0,
+        versions: [{
+          prompt: "Proposal: Re-architect 14 microservices into a unified modular monolith with strict domain boundaries.",
+          text: `### Core Thesis:
+Our current 14 microservices create unacceptable developer overhead: distributed tracing complexity, flaky end-to-end testing, and cross-service latency penalties (280ms average p99 overhead).
+Consolidation into a **Modular Monolith** using strict Go packages and unified database transactions will accelerate shipping velocity 3x.`,
+          prompts: ["Audit deployment decoupling", "Compare database lock contention"]
+        }]
+      };
+      const a2: GridNodeData = {
+        id: 'node-tpl-arch-2',
+        x: 580,
+        y: 80,
+        width: NODE_WIDTH,
+        prompt: "Devil's Advocate: Shared database saturation and simultaneous deployment blockers.",
+        role: 'stress_test',
+        status: 'ready',
+        versionIndex: 0,
+        incomingEdges: [{ sourceId: 'node-tpl-arch-1', type: 'counter_argument', label: 'Decoupling Risks' }],
+        versions: [{
+          prompt: "Devil's Advocate: Shared database saturation and simultaneous deployment blockers.",
+          text: `### Failure Modes:
+1. **Single Point of Failure**: A bad migration or memory leak in the reporting module brings down the primary checkout engine.
+2. **Release Train Contention**: 5 engineering teams blocked waiting for a single master CI pipeline to clear.
+3. **Database Connection Pool Exhaustion**: Shared connection pools hit saturation under spike load.`,
+          prompts: ["Isolate reporting schema", "Enforce read replicas"]
+        }]
+      };
+      const a3: GridNodeData = {
+        id: 'node-tpl-arch-3',
+        x: 1080,
+        y: 240,
+        width: NODE_WIDTH,
+        prompt: "Synthesized Decision Verdict: Core Monolith with Read Replicas and Isolated Critical Checkout Worker.",
+        role: 'decision',
+        confidenceScore: 85,
+        status: 'ready',
+        versionIndex: 0,
+        incomingEdges: [
+          { sourceId: 'node-tpl-arch-1', type: 'source_of_truth' },
+          { sourceId: 'node-tpl-arch-2', type: 'source_of_truth' }
+        ],
+        versions: [{
+          prompt: "Synthesized Decision Verdict: Core Monolith with Read Replicas and Isolated Critical Checkout Worker.",
+          text: `### Executive Decision Verdict (Confidence: 85%)
+**RECOMMENDATION**: Merge 12 supporting microservices into the core modular monolith, while keeping the high-availability Checkout Worker isolated.
+
+**Mitigations**:
+- Enforce private Postgres schemas per domain package.
+- Offload all analytical queries to dedicated read replicas to guarantee checkout latency SLA.`,
+          prompts: ["Generate Decision Brief", "Plan phase 1 migration"]
+        }]
+      };
+      setNodes([a1, a2, a3]);
+      setTransform({ x: -40, y: -40, scale: 0.75 });
+    }
+  };
+
+  const getDecisionBriefMarkdown = () => {
+    const decisions = nodes.filter(n => n.role === 'decision');
+    const hypotheses = nodes.filter(n => n.role === 'hypothesis');
+    const stressTests = nodes.filter(n => n.role === 'stress_test');
+    const evidence = nodes.filter(n => n.role === 'evidence');
+
+    let memo = `# EXECUTIVE DECISION BRIEF\n`;
+    memo += `*Generated on ${new Date().toLocaleDateString()} | Non-Linear Argument Graph Synthesis*\n\n`;
+    
+    memo += `## Epistemic Audit Breakdown\n`;
+    memo += `- **Total Reasoning Nodes**: ${nodes.length}\n`;
+    memo += `- **Core Hypotheses Explored**: ${hypotheses.length}\n`;
+    memo += `- **Adversarial Stress-Tests / Devil's Advocates**: ${stressTests.length}\n`;
+    memo += `- **Ground Truth Evidence Citations**: ${evidence.length}\n`;
+    memo += `- **Synthesized Verdicts**: ${decisions.length}\n\n`;
+
+    memo += `---\n\n`;
+
+    memo += `## 1. Executive Verdicts & Strategic Recommendations\n\n`;
+    if (decisions.length === 0) {
+      memo += `*No formal decision node synthesized yet. Click [Decide] on any reasoning branch to generate an audit-proof verdict.*\n\n`;
+    } else {
+      decisions.forEach((d, i) => {
+        const v = d.versions[d.versionIndex] || d;
+        memo += `### Verdict ${i + 1}: ${d.prompt}\n`;
+        if (d.confidenceScore) memo += `**Confidence Rating**: ${d.confidenceScore}%\n\n`;
+        memo += `${v.text}\n\n`;
+      });
+    }
+
+    memo += `## 2. Adversarial Stress-Tests & Addressed Vulnerabilities\n\n`;
+    if (stressTests.length === 0) {
+      memo += `*No adversarial stress-tests recorded. Click [Stress-Test] on any hypothesis to explore failure modes.*\n\n`;
+    } else {
+      stressTests.forEach((st, i) => {
+        const v = st.versions[st.versionIndex] || st;
+        memo += `### Challenge ${i + 1}: ${st.prompt}\n`;
+        memo += `${v.text}\n\n`;
+      });
+    }
+
+    memo += `## 3. Core Strategic Hypotheses Explored\n\n`;
+    hypotheses.forEach((h, i) => {
+      const v = h.versions[h.versionIndex] || h;
+      memo += `### Hypothesis ${i + 1}: ${h.prompt}\n`;
+      memo += `${v.text}\n\n`;
+    });
+
+    if (evidence.length > 0) {
+      memo += `## 4. Ground Truth Evidence & Citations\n\n`;
+      evidence.forEach((e, i) => {
+        const v = e.versions[e.versionIndex] || e;
+        memo += `### Source Evidence ${i + 1}: ${e.prompt}\n`;
+        memo += `${v.text}\n\n`;
+      });
+    }
+
+    return memo;
   };
 
   const handleSearchSubmit = async (e: React.FormEvent) => {
@@ -1190,6 +1629,9 @@ export default function App() {
     };
     
     const toDelete = [nodeId, ...getDescendants(nodeId, nodes)];
+    toDelete.forEach(id => {
+      vectorMemoryStore.removeNodeChunks(id).catch(err => console.warn("Failed to remove node chunks from vector store", err));
+    });
     setNodes(prev => prev.filter(n => !toDelete.includes(n.id)));
   };
 
@@ -1322,13 +1764,13 @@ export default function App() {
         }
       });
 
-      setNodes(prev => [...prev.map(n => n.id === nodeId ? { ...n, status: 'ready' } : n), ...newNodes]);
+      setNodes(prev => [...prev.map(n => n.id === nodeId ? { ...n, status: 'ready' as const } : n), ...newNodes]);
     } catch (err: any) {
       console.error(err);
       const endMs = Date.now();
       setNodes(prev => prev.map(n => n.id === nodeId ? { 
         ...n, 
-        status: 'error',
+        status: 'error' as const,
         executionLog: {
           modelUsed: selectedTextModel.split('|')[1],
           requestPayload: reqBody,
@@ -1563,17 +2005,27 @@ export default function App() {
               onPortDrop={handlePortDrop}
               onCorrectionDrop={handleCorrectionDrop}
               onOpenDebug={setDebugNodeId}
+              onStressTest={handleStressTest}
+              onSynthesizeBranch={handleSynthesizeBranch}
+              onFindEvidence={handleFindEvidence}
+              onAlternateHypothesis={handleAlternateHypothesis}
+              onChangeRole={handleChangeRole}
               isXRayMode={isXRayMode}
             />
           );
         })}
       </div>
 
-      {/* Initial Search UI */}
+      {/* Initial Search UI & Starter Canvases */}
       {nodes.length === 0 && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none p-4">
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none p-4 z-20">
+          <div className="text-center mb-3 pointer-events-auto">
+            <span className="bg-black text-yellow-300 font-mono text-[10px] uppercase font-bold tracking-widest px-3 py-1 rounded-full shadow-md">
+              Adversarial Reasoning & Decision Studio
+            </span>
+          </div>
           <h1 
-            className="font-tomorrow font-bold text-4xl md:text-[60px] tracking-[-0.02em] mb-4 md:mb-2 text-black pointer-events-auto"
+            className="font-tomorrow font-bold text-4xl md:text-[54px] tracking-[-0.02em] mb-4 md:mb-3 text-black pointer-events-auto"
           >
             GRIDSCAPE
           </h1>
@@ -1583,7 +2035,7 @@ export default function App() {
               <input
                 autoFocus
                 className="flex-1 outline-none font-sans text-base sm:text-lg lg:text-xl py-2 sm:py-3 w-full"
-                placeholder="What do you want to explore?"
+                placeholder="Enter a strategic premise, thesis, or dilemma..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
               />
@@ -1598,7 +2050,7 @@ export default function App() {
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
                 className="p-2 hover:bg-gray-100 rounded-full transition-colors cursor-pointer text-gray-400 hover:text-black"
-                title="Upload Document or Image"
+                title="Ground with PDF, Paper, or Document"
               >
                 <Paperclip size={20} />
               </button>
@@ -1607,19 +2059,69 @@ export default function App() {
               <button 
                 onClick={handleSearchSubmit}
                 className="flex-1 sm:flex-none sm:w-12 h-12 bg-black text-white flex items-center justify-center hover:bg-gray-800 transition-colors cursor-pointer"
+                title="Begin Reasoning Graph"
               >
                 <Play fill="currentColor" size={20} />
               </button>
               <button 
                 onClick={handleMagicWand}
                 className="flex-1 sm:flex-none sm:w-12 h-12 border-2 border-black text-black bg-yellow-100 flex items-center justify-center hover:bg-yellow-200 transition-colors cursor-pointer"
+                title="Explore Adjacent Hypotheses"
               >
                 <Sparkles size={20} />
               </button>
             </div>
           </div>
-          <div className="mt-6 md:mt-8 text-center text-[10px] md:text-xs font-mono text-gray-500 max-w-lg leading-relaxed uppercase tracking-widest px-4 md:px-0">
-            GRIDSCAPE IS AN INFINITE SPATIAL-KNOWLEDGE-ENGINE FOR MAPPING COMPLEX IDEAS... START WITH ANY TOPIC AND GENERATE NON-LINEAR RESEARCH NODES...
+
+          {/* Quick-Launch Decision Frameworks */}
+          <div className="pointer-events-auto mt-6 w-full max-w-2xl flex flex-col gap-2">
+            <div className="text-[10px] font-mono uppercase tracking-widest text-gray-500 font-bold px-1">
+              Instant Decision Frameworks (Pre-Wired Graphs):
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <button
+                onClick={() => handleLoadTemplate('pricing')}
+                className="bg-white hover:bg-yellow-50 border-2 border-black p-3 text-left shadow-[3px_3px_0px_#000] active:translate-x-[1px] active:translate-y-[1px] cursor-pointer transition-all flex flex-col justify-between"
+              >
+                <div className="flex items-center gap-1.5 text-xs font-mono font-bold text-gray-900 mb-1">
+                  <span className="text-sm">⚡</span>
+                  <span>Hybrid AI Pricing</span>
+                </div>
+                <div className="text-[11px] text-gray-600 line-clamp-2">
+                  Seat-based vs Usage token floor; procurement & churn stress-test.
+                </div>
+              </button>
+
+              <button
+                onClick={() => handleLoadTemplate('slm')}
+                className="bg-white hover:bg-indigo-50 border-2 border-black p-3 text-left shadow-[3px_3px_0px_#000] active:translate-x-[1px] active:translate-y-[1px] cursor-pointer transition-all flex flex-col justify-between"
+              >
+                <div className="flex items-center gap-1.5 text-xs font-mono font-bold text-gray-900 mb-1">
+                  <span className="text-sm">🔬</span>
+                  <span>SLM vs Frontier</span>
+                </div>
+                <div className="text-[11px] text-gray-600 line-clamp-2">
+                  Fine-tuned 8B inference vs remote API costs & hallucination limits.
+                </div>
+              </button>
+
+              <button
+                onClick={() => handleLoadTemplate('architecture')}
+                className="bg-white hover:bg-cyan-50 border-2 border-black p-3 text-left shadow-[3px_3px_0px_#000] active:translate-x-[1px] active:translate-y-[1px] cursor-pointer transition-all flex flex-col justify-between"
+              >
+                <div className="flex items-center gap-1.5 text-xs font-mono font-bold text-gray-900 mb-1">
+                  <span className="text-sm">🛡️</span>
+                  <span>Monolith vs Microservices</span>
+                </div>
+                <div className="text-[11px] text-gray-600 line-clamp-2">
+                  Latency overhead & dev velocity vs shared database lock contention.
+                </div>
+              </button>
+            </div>
+          </div>
+
+          <div className="mt-5 text-center text-[10px] md:text-xs font-mono text-gray-500 max-w-lg leading-relaxed uppercase tracking-widest px-4 md:px-0">
+            NON-LINEAR REASONING • ADVERSARIAL STRESS-TESTING • VECTOR MEMORY GROUNDING • AUDIT-PROOF DECISIONS
           </div>
         </div>
       )}
@@ -1767,6 +2269,14 @@ export default function App() {
 
       {/* Global Top Right Controls */}
       <div className="absolute top-4 right-4 md:top-6 md:right-6 flex gap-2 pointer-events-auto">
+        <button 
+            onClick={() => setIsDecisionBriefOpen(true)}
+            className="bg-amber-300 border-2 border-black text-[10px] md:text-xs font-mono font-bold px-3 py-2 md:px-4 md:py-2 hover:bg-amber-400 text-black transition-colors shadow-[2px_2px_0px_#000] md:shadow-[4px_4px_0px_#000] cursor-pointer flex items-center gap-1.5"
+            title="Generate Audit-Proof Decision Brief"
+        >
+            <CheckCircle2 size={14} className="text-amber-900" />
+            <span>[ DECISION BRIEF ]</span>
+        </button>
         <button 
             onClick={handleAutoCluster}
             className="bg-white border-2 border-black text-[10px] md:text-xs font-mono font-bold px-3 py-2 md:px-4 md:py-2 hover:bg-yellow-200 transition-colors shadow-[2px_2px_0px_#000] md:shadow-[4px_4px_0px_#000] cursor-pointer flex items-center gap-2"
@@ -2155,6 +2665,30 @@ export default function App() {
                       {JSON.stringify(nodes.find(n => n.id === debugNodeId)?.executionLog?.responsePayload, null, 2)}
                     </pre>
                   </div>
+
+                  {nodes.find(n => n.id === debugNodeId)?.executionLog?.retrievedChunks && (
+                    <div className="flex flex-col gap-2 bg-yellow-50 border-2 border-black p-3">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold uppercase text-black text-[11px] flex items-center gap-1.5">
+                          🧠 Semantic Vector Memory Hits ({nodes.find(n => n.id === debugNodeId)?.executionLog?.retrievedChunks?.length})
+                        </span>
+                        <span className="text-[10px] text-gray-600 uppercase font-mono">Cosine Similarity</span>
+                      </div>
+                      <div className="flex flex-col gap-2 mt-1">
+                        {nodes.find(n => n.id === debugNodeId)?.executionLog?.retrievedChunks?.map((chunk, cIdx) => (
+                          <div key={chunk.id || cIdx} className="bg-white border border-black p-2 shadow-[2px_2px_0px_#000]">
+                            <div className="flex items-center justify-between text-[10px] font-bold pb-1 border-b border-gray-200">
+                              <span className="truncate max-w-[280px]">{chunk.sourceName}: {chunk.heading || 'Chunk'}</span>
+                              <span className="bg-black text-white px-1.5 py-0.5 rounded text-[9px] font-mono">
+                                {Math.round(chunk.score * 100)}% match
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-gray-800 line-clamp-3 mt-1 font-sans">{chunk.text}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </>
               ) : (
                 <div className="text-center p-8 text-gray-500">
@@ -2162,6 +2696,91 @@ export default function App() {
                   No execution logs available for this node.<br/>Logs are captured during new generations.
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Decision Brief Modal */}
+      {isDecisionBriefOpen && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm pointer-events-auto p-4">
+          <div className="bg-white border-2 border-black w-full max-w-3xl shadow-[8px_8px_0px_#000] p-6 relative flex flex-col gap-4 max-h-[85vh]">
+            <div className="flex justify-between items-center border-b-2 border-black pb-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="bg-amber-300 text-amber-950 font-mono text-[10px] uppercase font-bold tracking-widest px-2 py-0.5 rounded border border-amber-600">
+                    Audit-Proof Synthesis
+                  </span>
+                  <span className="font-mono text-xs text-gray-500">
+                    {nodes.length} Nodes in Reasoning Graph
+                  </span>
+                </div>
+                <h2 className="font-bold font-mono text-2xl uppercase tracking-tight text-gray-900 mt-1">
+                  Executive Decision Brief
+                </h2>
+              </div>
+              <button 
+                onClick={() => setIsDecisionBriefOpen(false)} 
+                className="hover:text-red-600 cursor-pointer self-start p-1"
+              >
+                <X size={22} />
+              </button>
+            </div>
+
+            {/* Epistemic Stat Badges */}
+            <div className="grid grid-cols-4 gap-2 font-mono text-xs">
+              <div className="bg-indigo-50 border border-indigo-200 p-2.5 rounded-sm">
+                <span className="text-[10px] text-indigo-700 block uppercase font-bold">Hypotheses</span>
+                <span className="text-xl font-bold text-indigo-950">{nodes.filter(n => n.role === 'hypothesis').length}</span>
+              </div>
+              <div className="bg-rose-50 border border-rose-200 p-2.5 rounded-sm">
+                <span className="text-[10px] text-rose-700 block uppercase font-bold">Stress-Tests</span>
+                <span className="text-xl font-bold text-rose-950">{nodes.filter(n => n.role === 'stress_test').length}</span>
+              </div>
+              <div className="bg-cyan-50 border border-cyan-200 p-2.5 rounded-sm">
+                <span className="text-[10px] text-cyan-700 block uppercase font-bold">Ground Truth</span>
+                <span className="text-xl font-bold text-cyan-950">{nodes.filter(n => n.role === 'evidence').length}</span>
+              </div>
+              <div className="bg-amber-50 border border-amber-300 p-2.5 rounded-sm">
+                <span className="text-[10px] text-amber-800 block uppercase font-bold">Resolved Verdicts</span>
+                <span className="text-xl font-bold text-amber-950">{nodes.filter(n => n.role === 'decision').length}</span>
+              </div>
+            </div>
+
+            {/* Formatted Markdown Preview */}
+            <div className="overflow-y-auto pr-2 bg-slate-50 border border-slate-300 p-4 rounded-sm max-h-[48vh] text-xs sm:text-sm leading-relaxed whitespace-pre-wrap font-sans text-gray-800">
+              {getDecisionBriefMarkdown()}
+            </div>
+
+            {/* Actions Bar */}
+            <div className="flex flex-col sm:flex-row gap-2 pt-2 border-t border-gray-200">
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(getDecisionBriefMarkdown());
+                  setCopiedBrief(true);
+                  setTimeout(() => setCopiedBrief(false), 2000);
+                }}
+                className="flex-1 bg-black text-white hover:bg-gray-800 font-mono font-bold text-xs uppercase py-3 border-2 border-black flex items-center justify-center gap-2 shadow-[2px_2px_0px_#000] cursor-pointer transition-colors"
+              >
+                {copiedBrief ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
+                <span>{copiedBrief ? "Copied to Clipboard!" : "Copy Full Markdown Brief"}</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  const blob = new Blob([getDecisionBriefMarkdown()], { type: 'text/markdown' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = `decision-brief-${Date.now()}.md`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                className="bg-white hover:bg-gray-100 text-black font-mono font-bold text-xs uppercase py-3 px-6 border-2 border-black flex items-center justify-center gap-2 shadow-[2px_2px_0px_#000] cursor-pointer transition-colors"
+              >
+                <Download size={16} />
+                <span>Download .md</span>
+              </button>
             </div>
           </div>
         </div>
